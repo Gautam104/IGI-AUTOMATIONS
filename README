@@ -1,0 +1,58 @@
+# IGI Diamond Automation — Deployment Notes
+
+## Files in this project
+- `app.py` — the Streamlit app
+- `packages.txt` — tells Streamlit Cloud to install Chromium + chromedriver at the OS level
+- `requirements.txt` — Python dependencies
+
+## Why the old version didn't work on Streamlit Cloud
+1. It used `ChromeDriverManager().install()`, which tries to download a
+   chromedriver binary from the internet at runtime. Streamlit Cloud's
+   network/sandbox blocks or breaks this, so the browser never started.
+2. It launched a normal (non-headless) Chrome window. Streamlit Cloud
+   servers have no display, so a visible browser cannot open there at all.
+3. `packages.txt` was missing entirely, so there was no Chrome/Chromium
+   binary on the server in the first place.
+
+## What this version does differently
+- Adds `packages.txt` with `chromium` and `chromium-driver`, installed by
+  Streamlit Cloud automatically as system packages before your app starts.
+- Runs Chrome with `--headless=new`, `--no-sandbox`, and
+  `--disable-dev-shm-usage`, which are required for Chrome to run inside
+  Streamlit Cloud's containers.
+- Looks up the installed Chromium and chromedriver paths directly instead
+  of downloading anything at runtime.
+- Replaces fixed `time.sleep()` waits with `WebDriverWait`, which moves on
+  as soon as the report data actually appears instead of always waiting
+  the full fixed number of seconds. This is the main speed gain.
+- Reuses a single browser session for the whole batch (`st.cache_resource`)
+  instead of implicitly relying on session state alone.
+- Adds a "Start Fetching" button so the file is shown for review before
+  any browser/scraping work begins.
+
+## Deploying
+1. Push these three files to a GitHub repo (root level, not in a subfolder,
+   unless you set the app's "Main file path" to match).
+2. On https://share.streamlit.io, create a new app pointing at `app.py`.
+3. Streamlit Cloud reads `packages.txt` and `requirements.txt`
+   automatically — no extra configuration needed.
+4. If you edit `packages.txt` after the first deploy, use "Reboot app" in
+   the Streamlit Cloud dashboard so the new system packages actually get
+   installed.
+
+## About the Cloudflare "Verify you are human" check
+A real Cloudflare human-verification challenge cannot be solved by code —
+there is no display on the cloud server and no person available to click
+it remotely. If this triggers mid-batch, the app will:
+- Stop the batch at that certificate
+- Keep all rows already fetched
+- Show an error telling you to wait a bit and click "Start Fetching" again
+
+This matches running the app fully cloud-hosted: most batches should pass
+through, since you mentioned it only appears once per session for you, but
+occasional manual restarts may be needed if the server's IP gets flagged.
+
+If this becomes frequent, the more reliable long-term fix is asking IGI
+about an official data/API access for verified report lookups, since
+scraping around a bot-protection wall isn't something I can help
+circumvent.
