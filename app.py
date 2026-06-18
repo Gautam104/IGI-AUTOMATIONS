@@ -13,6 +13,20 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
+
+# ==========================================
+# TEMPORARY DEBUG CODE
+# ==========================================
+
+st.write("Chromium:", shutil.which("chromium"))
+st.write("Chromedriver:", shutil.which("chromedriver"))
+
+st.write("Chromedriver glob:")
+st.write(glob.glob("/usr/lib/chromium*/**/chromedriver", recursive=True))
+st.write(glob.glob("/usr/bin/*chromedriver*"))
+
+st.write("Chromium glob:")
+st.write(glob.glob("/usr/lib/chromium*/*"))
 # ----------------------------------------------------------------------
 # PAGE CONFIG
 # ----------------------------------------------------------------------
