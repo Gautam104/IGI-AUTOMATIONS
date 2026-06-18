@@ -1,5 +1,8 @@
+import os
 import time
+import glob
 import shutil
+import subprocess
 import pandas as pd
 import streamlit as st
 
@@ -28,12 +31,18 @@ st.caption(
 CLOUDFLARE_MARKERS = ["Performing security verification", "Verify you are human", "Just a moment"]
 
 
+def _first_existing(paths):
+    for path in paths:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
 def find_chromium_binary():
     """
-    Locate a usable Chromium/Chrome binary.
-    On Streamlit Community Cloud, packages.txt installs 'chromium' and
-    'chromium-driver', which land at predictable paths. Locally, this
-    falls back to whatever Chrome/Chromium is already installed.
+    Locate a usable Chromium/Chrome binary installed via packages.txt.
+    Checks fixed paths first, then PATH, then a filesystem glob as a
+    last resort (covers versioned/alternate install locations).
     """
     candidates = [
         "/usr/bin/chromium",
@@ -41,29 +50,66 @@ def find_chromium_binary():
         "/usr/bin/google-chrome",
         "/usr/bin/google-chrome-stable",
     ]
-    for path in candidates:
-        if shutil.which(path) or __import__("os").path.exists(path):
-            return path
-    # Fall back to PATH lookup
+    found = _first_existing(candidates)
+    if found:
+        return found
+
     for name in ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable"]:
         found = shutil.which(name)
         if found:
             return found
+
+    for pattern in ["/usr/lib/chromium*/chromium*", "/usr/lib/chromium-browser/chromium*"]:
+        matches = glob.glob(pattern)
+        if matches:
+            return matches[0]
+
     return None
 
 
 def find_chromedriver_binary():
     """
-    Locate chromedriver installed via packages.txt (chromium-driver),
-    avoiding any runtime download (which fails on Streamlit Cloud's
-    restricted network and is the main reason the old script never ran).
+    Locate the chromedriver installed via packages.txt (chromium-driver).
+    Deliberately does NOT fall back to letting Selenium/Selenium Manager
+    auto-download a driver -- on Streamlit Cloud that downloads a binary
+    with a mismatched architecture/glibc that fails with exit code 127.
     """
-    candidates = ["/usr/bin/chromedriver", "/usr/lib/chromium-browser/chromedriver"]
-    for path in candidates:
-        if shutil.which(path) or __import__("os").path.exists(path):
-            return path
+    candidates = [
+        "/usr/bin/chromedriver",
+        "/usr/lib/chromium-browser/chromedriver",
+        "/usr/lib/chromium/chromedriver",
+    ]
+    found = _first_existing(candidates)
+    if found:
+        return found
+
     found = shutil.which("chromedriver")
-    return found
+    if found:
+        return found
+
+    matches = glob.glob("/usr/lib/chromium*/chromedriver")
+    if matches:
+        return matches[0]
+
+    return None
+
+
+def diagnose_missing_browser():
+    """
+    Build a clear diagnostic message when Chromium/chromedriver aren't
+    found, so the fix is obvious instead of a raw stack trace.
+    """
+    lines = ["Chromium/chromedriver were not found on this server.", ""]
+    try:
+        dpkg_out = subprocess.run(
+            ["dpkg", "-l", "chromium", "chromium-driver"],
+            capture_output=True, text=True, timeout=5,
+        )
+        lines.append("dpkg status:")
+        lines.append(dpkg_out.stdout or dpkg_out.stderr)
+    except Exception as e:
+        lines.append(f"Could not run dpkg check: {e}")
+    return "\n".join(lines)
 
 
 @st.cache_resource(show_spinner=False)
@@ -75,6 +121,24 @@ def get_browser():
     """
     chrome_binary = find_chromium_binary()
     driver_binary = find_chromedriver_binary()
+
+    # IMPORTANT: do not silently fall back to letting Selenium/Selenium
+    # Manager auto-download a driver. On Streamlit Cloud that downloads a
+    # binary into ~/.cache/selenium/... that does not match the
+    # container's architecture and fails with "unexpectedly exited,
+    # status code 127". If packages.txt installed things correctly,
+    # chrome_binary/driver_binary should both be found above -- if not,
+    # fail loudly here with a diagnosis instead of limping into a broken
+    # auto-downloaded driver.
+    if not chrome_binary or not driver_binary:
+        raise RuntimeError(
+            "chrome_binary="
+            + str(chrome_binary)
+            + ", driver_binary="
+            + str(driver_binary)
+            + "\n\n"
+            + diagnose_missing_browser()
+        )
 
     options = webdriver.ChromeOptions()
     options.page_load_strategy = "eager"
@@ -89,16 +153,8 @@ def get_browser():
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
 
-    if chrome_binary:
-        options.binary_location = chrome_binary
-
-    if driver_binary:
-        service = Service(executable_path=driver_binary)
-    else:
-        # Last-resort fallback for local dev where Selenium Manager can
-        # resolve a driver itself. On Streamlit Cloud this branch should
-        # never be hit if packages.txt is set up correctly.
-        service = Service()
+    options.binary_location = chrome_binary
+    service = Service(executable_path=driver_binary)
 
     browser = webdriver.Chrome(service=service, options=options)
     browser.set_page_load_timeout(40)
@@ -192,11 +248,22 @@ if uploaded_file and not st.session_state.processed:
     if start_clicked:
         try:
             browser = get_browser()
+        except RuntimeError as e:
+            st.error(
+                "Chromium or chromedriver could not be found on this server. "
+                "This means 'packages.txt' either wasn't picked up or didn't "
+                "install correctly. In the Streamlit Cloud dashboard: open "
+                "your app's menu -> 'Reboot app'. If that doesn't help, open "
+                "'Manage app' -> check the build logs for an 'apt-get' error "
+                "during the packages.txt install step."
+            )
+            st.code(str(e))
+            st.stop()
         except WebDriverException as e:
             st.error(
-                "Could not start the browser. On Streamlit Community Cloud, make sure "
-                "'packages.txt' (with chromium and chromium-driver) is present in the repo "
-                "and the app has been rebooted after adding it."
+                "Chromium/chromedriver were found but the browser still failed "
+                "to start. This is usually a container resource issue "
+                "(out of memory) rather than a missing-package issue."
             )
             st.exception(e)
             st.stop()
