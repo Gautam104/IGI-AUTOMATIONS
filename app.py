@@ -1,289 +1,297 @@
 import time
+import shutil
 import pandas as pd
 import streamlit as st
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, WebDriverException
 
-# TITLE
+# ----------------------------------------------------------------------
+# PAGE CONFIG
+# ----------------------------------------------------------------------
+st.set_page_config(page_title="IGI Diamond Automation", layout="wide")
 st.title("IGI Diamond Automation")
 
-# FILE UPLOAD
-uploaded_file = st.file_uploader(
-    "Upload Excel File",
-    type=["xlsx"]
+st.caption(
+    "Upload an Excel file with a column named **LG Number** containing "
+    "9-digit IGI certificate numbers."
 )
 
-if uploaded_file and "processed" not in st.session_state:
+# ----------------------------------------------------------------------
+# HELPERS
+# ----------------------------------------------------------------------
 
-    # READ EXCEL
-    df = pd.read_excel(uploaded_file)
+CLOUDFLARE_MARKERS = ["Performing security verification", "Verify you are human", "Just a moment"]
 
-    st.write(df)
 
-    # RESULTS
-    results = []
+def find_chromium_binary():
+    """
+    Locate a usable Chromium/Chrome binary.
+    On Streamlit Community Cloud, packages.txt installs 'chromium' and
+    'chromium-driver', which land at predictable paths. Locally, this
+    falls back to whatever Chrome/Chromium is already installed.
+    """
+    candidates = [
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+    ]
+    for path in candidates:
+        if shutil.which(path) or __import__("os").path.exists(path):
+            return path
+    # Fall back to PATH lookup
+    for name in ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable"]:
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
 
-    # CHROME OPTIONS
+
+def find_chromedriver_binary():
+    """
+    Locate chromedriver installed via packages.txt (chromium-driver),
+    avoiding any runtime download (which fails on Streamlit Cloud's
+    restricted network and is the main reason the old script never ran).
+    """
+    candidates = ["/usr/bin/chromedriver", "/usr/lib/chromium-browser/chromedriver"]
+    for path in candidates:
+        if shutil.which(path) or __import__("os").path.exists(path):
+            return path
+    found = shutil.which("chromedriver")
+    return found
+
+
+@st.cache_resource(show_spinner=False)
+def get_browser():
+    """
+    Build a single headless Chrome/Chromium session, reused across the
+    whole batch run. Cached as a resource so Streamlit doesn't relaunch
+    a browser on every rerun.
+    """
+    chrome_binary = find_chromium_binary()
+    driver_binary = find_chromedriver_binary()
+
     options = webdriver.ChromeOptions()
     options.page_load_strategy = "eager"
 
-    options.add_argument("--start-maximized")
-
+    # Headless is mandatory on a server with no display
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
     options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
 
-    options.add_experimental_option(
-        "excludeSwitches",
-        ["enable-automation"]
-    )
+    if chrome_binary:
+        options.binary_location = chrome_binary
 
-    options.add_experimental_option(
-        "useAutomationExtension",
-        False
-    )
+    if driver_binary:
+        service = Service(executable_path=driver_binary)
+    else:
+        # Last-resort fallback for local dev where Selenium Manager can
+        # resolve a driver itself. On Streamlit Cloud this branch should
+        # never be hit if packages.txt is set up correctly.
+        service = Service()
 
-    # OPEN BROWSER
-    browser = webdriver.Chrome(
-        service=Service(
-            ChromeDriverManager().install()
-        ),
-        options=options
-    )
-
-    time.sleep(10)
-
+    browser = webdriver.Chrome(service=service, options=options)
     browser.set_page_load_timeout(40)
+    return browser
 
-    # LOOP ALL LG NUMBERS
-    total_records = len(df)
 
-    progress_bar = st.progress(0)
+def page_has_cloudflare(browser) -> bool:
+    try:
+        body_text = browser.find_element(By.TAG_NAME, "body").text
+    except Exception:
+        return False
+    return any(marker in body_text for marker in CLOUDFLARE_MARKERS)
 
-    # progress_text = st.empty()
 
-    for index, cert in enumerate(df["LG Number"]):
+def wait_for_report_data(browser, timeout=15):
+    """
+    Wait until either the report data has rendered or we hit timeout,
+    instead of always sleeping the full fixed duration. Returns the
+    page text as soon as a known field label shows up.
+    """
+    try:
+        WebDriverWait(browser, timeout).until(
+            lambda b: any(
+                marker in b.find_element(By.TAG_NAME, "body").text
+                for marker in ["Shape and Cutting Style", "Carat Weight", "Color Grade"]
+            )
+            or page_has_cloudflare(b)
+        )
+    except TimeoutException:
+        pass
+    return browser.find_element(By.TAG_NAME, "body").text
 
-        cert_original = str(cert).strip()
 
+def parse_report(page_text: str) -> dict:
+    shape, carat, color, clarity, growth_type = "", "", "", "", ""
+    lines = [line.strip() for line in page_text.split("\n")]
+
+    for i, line in enumerate(lines):
+        if "Shape and Cutting Style" in line and i + 1 < len(lines):
+            shape = lines[i + 1]
+
+        if "Carat Weight" in line and i + 1 < len(lines):
+            carat = "".join(c for c in lines[i + 1] if c.isdigit() or c == ".")
+
+        if "Color Grade" in line and i + 1 < len(lines):
+            color = lines[i + 1]
+
+        if "Clarity Grade" in line and i + 1 < len(lines):
+            clarity = lines[i + 1].replace(" ", "")
+
+        if "CVD" in line.upper():
+            growth_type = "CVD"
+        elif "HPHT" in line.upper():
+            growth_type = "HPHT"
+
+    return {
+        "Shape": shape,
+        "Carat": carat,
+        "Color": color,
+        "Clarity": clarity,
+        "Growth Type": growth_type,
+    }
+
+
+# ----------------------------------------------------------------------
+# SESSION STATE
+# ----------------------------------------------------------------------
+if "processed" not in st.session_state:
+    st.session_state.processed = False
+if "results" not in st.session_state:
+    st.session_state.results = []
+if "cloudflare_block" not in st.session_state:
+    st.session_state.cloudflare_block = False
+
+# ----------------------------------------------------------------------
+# FILE UPLOAD
+# ----------------------------------------------------------------------
+uploaded_file = st.file_uploader("Upload Excel File", type=["xlsx"])
+
+if uploaded_file and not st.session_state.processed:
+    df = pd.read_excel(uploaded_file)
+
+    if "LG Number" not in df.columns:
+        st.error("The uploaded file must contain a column named 'LG Number'.")
+        st.stop()
+
+    st.write(df)
+
+    start_clicked = st.button("Start Fetching", type="primary")
+
+    if start_clicked:
         try:
+            browser = get_browser()
+        except WebDriverException as e:
+            st.error(
+                "Could not start the browser. On Streamlit Community Cloud, make sure "
+                "'packages.txt' (with chromium and chromium-driver) is present in the repo "
+                "and the app has been rebooted after adding it."
+            )
+            st.exception(e)
+            st.stop()
 
-            # DIRECT REPORT URL
+        results = []
+        total_records = len(df)
+        progress_bar = st.progress(0)
+        status_box = st.empty()
+        cloudflare_notice = st.empty()
+
+        for index, cert in enumerate(df["LG Number"]):
+            cert_original = str(cert).strip()
             url = f"https://www.igi.org/verify-your-report/?r={cert_original}"
 
-            browser.get(url)
-
-            # INITIAL WAIT
-            time.sleep(5)
-
-            # WAIT UNTIL CLOUDFLARE FINISHES
-            while True:
-
-                page_text_check = browser.find_element(
-                    By.TAG_NAME,
-                    "body"
-                ).text
-
-                if (
-                    "Performing security verification" not in page_text_check
-                    and
-                    "Verify you are human" not in page_text_check
-                ):
-                    break
-
-                st.warning(
-                    f"Complete Cloudflare verification for {cert_original}"
-                )
-
-                time.sleep(1)
-
-            # EXTRA WAIT AFTER VERIFY
-            time.sleep(1)
-
-            # GET FULL PAGE TEXT
-            page_text = browser.find_element(
-                By.TAG_NAME,
-                "body"
-            ).text
-
-            # DEBUG OUTPUT
-            # st.text(page_text[:3000])
-
-            # DEFAULT VALUES
-            shape = ""
-            carat = ""
-            color = ""
-            clarity = ""
-            growth_type = ""
-
-            # SPLIT PAGE LINES
-            lines = page_text.split("\n")
-
-            # LOOP THROUGH TEXT
-            for i, line in enumerate(lines):
-
-                line = line.strip()
-
-                # SHAPE
-                if "Shape and Cutting Style" in line:
-                    try:
-                        shape = lines[i + 1]
-                    except:
-                        pass
-
-                # MEASUREMENTS
-                if "Measurements" in line:
-                    try:
-                        measurements = lines[i + 1]
-                    except:
-                        pass
-
-                # CARAT
-                if "Carat Weight" in line:
-                    try:
-                        carat = lines[i + 1]
-
-                        carat = ''.join(c for c in carat if c.isdigit() or c == '.')
-                    except:
-                        pass
-
-                # COLOR
-                if "Color Grade" in line:
-                    try:
-                        color = lines[i + 1]
-                    except:
-                        pass
-
-                # CLARITY
-                if "Clarity Grade" in line:
-                    try:
-                        clarity = lines[i + 1]
-
-                        clarity = clarity.replace(" ", "")
-                    except:
-                        pass
-
-                # CVD / HPHT
-                if "CVD" in line.upper():
-                    growth_type = "CVD"
-                
-                elif "HPHT" in line.upper():
-                    growth_type = "HPHT"  
-                    
-                        # RETRY IF DATA EMPTY
-            if shape == "" and carat == "" and color == "":
-
-                time.sleep(3)
-
-                page_text = browser.execute_script(
-                    "return document.body.innerText;"
-                )
-
-                lines = page_text.split("\n")
-
-                for i, line in enumerate(lines):
-
-                    line = line.strip()
-
-                    # SHAPE
-                    if "Shape and Cutting Style" in line:
-                        try:
-                            shape = lines[i + 1]
-                        except:
-                            pass
-
-                    # CARAT
-                    if "Carat Weight" in line:
-                        try:
-                            carat = ''.join(
-                                c for c in lines[i + 1]
-                                if c.isdigit() or c == '.'
-                            )
-                        except:
-                            pass
-
-                    # COLOR
-                    if "Color Grade" in line:
-                        try:
-                            color = lines[i + 1]
-                        except:
-                            pass              
-
-            # SAVE RESULTS
-            results.append({
-                "LG Number": cert_original,
-                "Shape": shape,
-                "Carat": carat,
-                "Color": color,
-                "Clarity": clarity,
-                "Growth Type": growth_type
-            })
-
-            progress_percent = int(((index + 1) / total_records) * 100)
-
-            progress_bar.progress((index + 1) / total_records, text=f"{progress_percent}% Completed | Processing : {cert_original}")
-
-            
-
-        except Exception as e:
-
-            st.error(f"ERROR : {cert_original}")
-
-            st.write(e)
-
-            time.sleep(5)
-
             try:
-
                 browser.get(url)
 
-                time.sleep(5)
+                # Give Cloudflare a brief moment, then check once rather
+                # than sleeping a fixed amount regardless of need.
+                time.sleep(1.5)
 
-                page_text = browser.execute_script("return document.body.innerText")
+                if page_has_cloudflare(browser):
+                    # A real Cloudflare "verify you are human" challenge
+                    # cannot be solved by code on a headless cloud server
+                    # (no display, no human to click it). We stop the
+                    # batch here rather than spin forever, and surface a
+                    # clear message so you know a manual restart/check is
+                    # needed -- this matches the trade-off you confirmed
+                    # (stay cloud-hosted, accept occasional manual restarts).
+                    st.session_state.cloudflare_block = True
+                    cloudflare_notice.error(
+                        f"Cloudflare verification triggered at certificate "
+                        f"{cert_original} ({index + 1}/{total_records}). "
+                        "This can't be solved automatically on a headless cloud "
+                        "server. Please wait a few minutes and click 'Start "
+                        "Fetching' again -- already-fetched rows below are kept."
+                    )
+                    break
 
-            except:
-                pass    
+                page_text = wait_for_report_data(browser, timeout=15)
+                parsed = parse_report(page_text)
 
-            # EMPTY VALUES
-            results.append({
-                "LG Number": cert_original,
-                "Shape": "",
-                "Carat": "",
-                "Color": "",
-                "Clarity": "",
-                "Growth Type": ""
-            })
+                # One retry if everything came back empty (page was slow)
+                if not parsed["Shape"] and not parsed["Carat"] and not parsed["Color"]:
+                    time.sleep(2)
+                    page_text = browser.execute_script("return document.body.innerText;")
+                    parsed = parse_report(page_text)
 
-    # CLOSE BROWSER
-    browser.quit()
+                results.append({"LG Number": cert_original, **parsed})
 
-    # OUTPUT DATAFRAME
-    output_df = pd.DataFrame(results)
+            except Exception as e:
+                status_box.warning(f"Error on {cert_original}: {e}")
+                results.append(
+                    {
+                        "LG Number": cert_original,
+                        "Shape": "",
+                        "Carat": "",
+                        "Color": "",
+                        "Clarity": "",
+                        "Growth Type": "",
+                    }
+                )
 
-    st.write("Final Output")
+            progress_percent = (index + 1) / total_records
+            progress_bar.progress(
+                progress_percent,
+                text=f"{int(progress_percent * 100)}% completed | Processing: {cert_original}",
+            )
 
+        st.session_state.results = results
+        st.session_state.processed = True
+        st.rerun()
+
+# ----------------------------------------------------------------------
+# OUTPUT
+# ----------------------------------------------------------------------
+if st.session_state.processed and st.session_state.results:
+    output_df = pd.DataFrame(st.session_state.results)
+
+    st.subheader("Final Output")
     st.dataframe(output_df)
 
-    # SAVE EXCEL
-    output_file = "diamond_output.xlsx"
+    output_file = "/tmp/diamond_output.xlsx"
+    output_df.to_excel(output_file, index=False)
 
-    output_df.to_excel(
-        output_file,
-        index=False
-    )
-
-    st.session_state.processed = True
-
-    # DOWNLOAD BUTTON
     with open(output_file, "rb") as file:
-
         st.download_button(
             label="Download Excel",
             data=file,
             file_name="diamond_output.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-
-
+    if st.button("Process a new file"):
+        st.session_state.processed = False
+        st.session_state.results = []
+        st.session_state.cloudflare_block = False
+        st.rerun()
