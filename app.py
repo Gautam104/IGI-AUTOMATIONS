@@ -10,154 +10,152 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
-
-# ==========================================
-# TEMPORARY DEBUG CODE
-# ==========================================
-
-st.write("Chromium:", shutil.which("chromium"))
-st.write("Chromedriver:", shutil.which("chromedriver"))
-
-st.write("Chromedriver glob:")
-st.write(glob.glob("/usr/lib/chromium*/**/chromedriver", recursive=True))
-st.write(glob.glob("/usr/bin/*chromedriver*"))
-
-st.write("Chromium glob:")
-st.write(glob.glob("/usr/lib/chromium*/*"))
-# ----------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # PAGE CONFIG
-# ----------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="IGI Diamond Automation", layout="wide")
-st.title("IGI Diamond Automation")
-
+st.title("💎 IGI Diamond Automation")
 st.caption(
-    "Upload an Excel file with a column named **LG Number** containing "
-    "9-digit IGI certificate numbers."
+    "Upload an Excel file with a column named **LG Number** "
+    "containing 9-digit IGI certificate numbers."
 )
 
-# ----------------------------------------------------------------------
-# HELPERS
-# ----------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# CHROME INSTALLER
+# Install Google Chrome + matching ChromeDriver at first run.
+# We do this in Python (not packages.txt) because Streamlit Cloud runs
+# Debian Bullseye, and the chromium apt package for that version depends
+# on libasound2t64 which conflicts with the pre-installed libasound2 —
+# causing the "held broken packages" error seen in the build logs.
+# Downloading Chrome directly from Google avoids that conflict entirely.
+# ─────────────────────────────────────────────────────────────────────────────
 
-CLOUDFLARE_MARKERS = ["Performing security verification", "Verify you are human", "Just a moment"]
+CHROME_DEB_URL   = "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb"
+CHROME_BIN       = "/usr/bin/google-chrome-stable"
+CHROMEDRIVER_BIN = "/usr/local/bin/chromedriver"
 
 
-def _first_existing(paths):
-    for path in paths:
-        if os.path.isfile(path) and os.access(path, os.X_OK):
-            return path
-    return None
-
-
-def find_chromium_binary():
+@st.cache_resource(show_spinner=False)
+def install_chrome_if_needed():
     """
-    Locate a usable Chromium/Chrome binary installed via packages.txt.
-    Checks fixed paths first, then PATH, then a filesystem glob as a
-    last resort (covers versioned/alternate install locations).
+    Download and install Google Chrome + matching ChromeDriver once per
+    container lifetime.  st.cache_resource means this runs only on the
+    first call; subsequent reruns reuse the cached result.
     """
-    candidates = [
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
-        "/usr/bin/google-chrome",
-        "/usr/bin/google-chrome-stable",
-    ]
-    found = _first_existing(candidates)
-    if found:
-        return found
+    log = []
 
-    for name in ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable"]:
-        found = shutil.which(name)
-        if found:
-            return found
-
-    for pattern in ["/usr/lib/chromium*/chromium*", "/usr/lib/chromium-browser/chromium*"]:
-        matches = glob.glob(pattern)
-        if matches:
-            return matches[0]
-
-    return None
-
-
-def find_chromedriver_binary():
-    """
-    Locate the chromedriver installed via packages.txt (chromium-driver).
-    Deliberately does NOT fall back to letting Selenium/Selenium Manager
-    auto-download a driver -- on Streamlit Cloud that downloads a binary
-    with a mismatched architecture/glibc that fails with exit code 127.
-    """
-    candidates = [
-        "/usr/bin/chromedriver",
-        "/usr/lib/chromium-browser/chromedriver",
-        "/usr/lib/chromium/chromedriver",
-    ]
-    found = _first_existing(candidates)
-    if found:
-        return found
-
-    found = shutil.which("chromedriver")
-    if found:
-        return found
-
-    matches = glob.glob("/usr/lib/chromium*/chromedriver")
-    if matches:
-        return matches[0]
-
-    return None
-
-
-def diagnose_missing_browser():
-    """
-    Build a clear diagnostic message when Chromium/chromedriver aren't
-    found, so the fix is obvious instead of a raw stack trace.
-    """
-    lines = ["Chromium/chromedriver were not found on this server.", ""]
-    try:
-        dpkg_out = subprocess.run(
-            ["dpkg", "-l", "chromium", "chromium-driver"],
-            capture_output=True, text=True, timeout=5,
+    # ── 1. Chrome ──────────────────────────────────────────────────────────
+    if os.path.isfile(CHROME_BIN):
+        log.append("✅ Chrome already installed.")
+    else:
+        log.append("⬇️  Downloading Google Chrome …")
+        r = subprocess.run(
+            ["wget", "-q", "-O", "/tmp/chrome.deb", CHROME_DEB_URL],
+            capture_output=True, text=True
         )
-        lines.append("dpkg status:")
-        lines.append(dpkg_out.stdout or dpkg_out.stderr)
+        if r.returncode != 0:
+            return False, log + [f"wget failed: {r.stderr}"]
+
+        log.append("📦 Installing Chrome …")
+        # apt-get -f install resolves any minor dependency gaps automatically
+        subprocess.run(
+            ["apt-get", "install", "-y", "/tmp/chrome.deb"],
+            capture_output=True, env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
+        )
+        subprocess.run(
+            ["apt-get", "install", "-f", "-y"],
+            capture_output=True, env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
+        )
+
+        if not os.path.isfile(CHROME_BIN):
+            return False, log + ["❌ Chrome binary not found after install."]
+        log.append("✅ Chrome installed.")
+
+    # ── 2. ChromeDriver ────────────────────────────────────────────────────
+    if os.path.isfile(CHROMEDRIVER_BIN):
+        log.append("✅ ChromeDriver already installed.")
+        return True, log
+
+    # Read the exact Chrome version to fetch a matching driver
+    ver_out = subprocess.run(
+        [CHROME_BIN, "--version", "--no-sandbox"],
+        capture_output=True, text=True
+    )
+    # e.g. "Google Chrome 125.0.6422.76 "
+    raw_ver = ver_out.stdout.strip().split()[-1]        # "125.0.6422.76"
+    major   = raw_ver.split(".")[0]                     # "125"
+    log.append(f"🔎 Chrome version: {raw_ver} (major={major})")
+
+    # ChromeDriver for Chrome ≥ 115 lives at the CfT JSON endpoint
+    import urllib.request, json
+    try:
+        cft_url  = f"https://googlechromelabs.github.io/chrome-for-testing/known-good-versions-with-downloads.json"
+        with urllib.request.urlopen(cft_url, timeout=15) as resp:
+            data = json.load(resp)
+
+        # Find latest version whose major matches Chrome's major
+        driver_url = None
+        for entry in reversed(data["versions"]):
+            if entry["version"].startswith(major + "."):
+                for dl in entry.get("downloads", {}).get("chromedriver", []):
+                    if dl["platform"] == "linux64":
+                        driver_url = dl["url"]
+                        break
+            if driver_url:
+                break
+
+        if not driver_url:
+            return False, log + [f"❌ No ChromeDriver found for major version {major}."]
+
     except Exception as e:
-        lines.append(f"Could not run dpkg check: {e}")
-    return "\n".join(lines)
+        return False, log + [f"❌ CfT lookup failed: {e}"]
+
+    log.append(f"⬇️  Downloading ChromeDriver from {driver_url} …")
+    r = subprocess.run(
+        ["wget", "-q", "-O", "/tmp/chromedriver.zip", driver_url],
+        capture_output=True, text=True
+    )
+    if r.returncode != 0:
+        return False, log + [f"❌ wget chromedriver failed: {r.stderr}"]
+
+    subprocess.run(["unzip", "-o", "/tmp/chromedriver.zip", "-d", "/tmp/"], capture_output=True)
+
+    # The zip extracts to  /tmp/chromedriver-linux64/chromedriver
+    extracted = glob.glob("/tmp/chromedriver-linux64/chromedriver")
+    if not extracted:
+        extracted = glob.glob("/tmp/chromedriver*/chromedriver")
+    if not extracted:
+        return False, log + ["❌ Could not find extracted chromedriver binary."]
+
+    subprocess.run(["cp", extracted[0], CHROMEDRIVER_BIN])
+    subprocess.run(["chmod", "+x", CHROMEDRIVER_BIN])
+
+    if not os.path.isfile(CHROMEDRIVER_BIN):
+        return False, log + ["❌ ChromeDriver not found after install."]
+
+    log.append("✅ ChromeDriver installed.")
+    return True, log
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BROWSER FACTORY
+# ─────────────────────────────────────────────────────────────────────────────
+
+CLOUDFLARE_MARKERS = [
+    "Performing security verification",
+    "Verify you are human",
+    "Just a moment",
+]
 
 
 @st.cache_resource(show_spinner=False)
 def get_browser():
-    """
-    Build a single headless Chrome/Chromium session, reused across the
-    whole batch run. Cached as a resource so Streamlit doesn't relaunch
-    a browser on every rerun.
-    """
-    chrome_binary = find_chromium_binary()
-    driver_binary = find_chromedriver_binary()
-
-    # IMPORTANT: do not silently fall back to letting Selenium/Selenium
-    # Manager auto-download a driver. On Streamlit Cloud that downloads a
-    # binary into ~/.cache/selenium/... that does not match the
-    # container's architecture and fails with "unexpectedly exited,
-    # status code 127". If packages.txt installed things correctly,
-    # chrome_binary/driver_binary should both be found above -- if not,
-    # fail loudly here with a diagnosis instead of limping into a broken
-    # auto-downloaded driver.
-    if not chrome_binary or not driver_binary:
-        raise RuntimeError(
-            "chrome_binary="
-            + str(chrome_binary)
-            + ", driver_binary="
-            + str(driver_binary)
-            + "\n\n"
-            + diagnose_missing_browser()
-        )
-
     options = webdriver.ChromeOptions()
+    options.binary_location = CHROME_BIN
     options.page_load_strategy = "eager"
 
-    # Headless is mandatory on a server with no display
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
@@ -167,35 +165,31 @@ def get_browser():
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
 
-    options.binary_location = chrome_binary
-    service = Service(executable_path=driver_binary)
-
+    service = Service(executable_path=CHROMEDRIVER_BIN)
     browser = webdriver.Chrome(service=service, options=options)
     browser.set_page_load_timeout(40)
     return browser
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SCRAPING HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
 def page_has_cloudflare(browser) -> bool:
     try:
-        body_text = browser.find_element(By.TAG_NAME, "body").text
+        body = browser.find_element(By.TAG_NAME, "body").text
+        return any(m in body for m in CLOUDFLARE_MARKERS)
     except Exception:
         return False
-    return any(marker in body_text for marker in CLOUDFLARE_MARKERS)
 
 
-def wait_for_report_data(browser, timeout=15):
-    """
-    Wait until either the report data has rendered or we hit timeout,
-    instead of always sleeping the full fixed duration. Returns the
-    page text as soon as a known field label shows up.
-    """
+def wait_for_report_data(browser, timeout=15) -> str:
     try:
         WebDriverWait(browser, timeout).until(
             lambda b: any(
-                marker in b.find_element(By.TAG_NAME, "body").text
-                for marker in ["Shape and Cutting Style", "Carat Weight", "Color Grade"]
-            )
-            or page_has_cloudflare(b)
+                m in b.find_element(By.TAG_NAME, "body").text
+                for m in ["Shape and Cutting Style", "Carat Weight", "Color Grade"]
+            ) or page_has_cloudflare(b)
         )
     except TimeoutException:
         pass
@@ -203,176 +197,135 @@ def wait_for_report_data(browser, timeout=15):
 
 
 def parse_report(page_text: str) -> dict:
-    shape, carat, color, clarity, growth_type = "", "", "", "", ""
-    lines = [line.strip() for line in page_text.split("\n")]
+    shape = carat = color = clarity = growth_type = ""
+    lines = [l.strip() for l in page_text.split("\n")]
 
     for i, line in enumerate(lines):
         if "Shape and Cutting Style" in line and i + 1 < len(lines):
             shape = lines[i + 1]
-
         if "Carat Weight" in line and i + 1 < len(lines):
             carat = "".join(c for c in lines[i + 1] if c.isdigit() or c == ".")
-
         if "Color Grade" in line and i + 1 < len(lines):
             color = lines[i + 1]
-
         if "Clarity Grade" in line and i + 1 < len(lines):
             clarity = lines[i + 1].replace(" ", "")
-
         if "CVD" in line.upper():
             growth_type = "CVD"
         elif "HPHT" in line.upper():
             growth_type = "HPHT"
 
-    return {
-        "Shape": shape,
-        "Carat": carat,
-        "Color": color,
-        "Clarity": clarity,
-        "Growth Type": growth_type,
-    }
+    return {"Shape": shape, "Carat": carat, "Color": color,
+            "Clarity": clarity, "Growth Type": growth_type}
 
 
-# ----------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # SESSION STATE
-# ----------------------------------------------------------------------
-if "processed" not in st.session_state:
-    st.session_state.processed = False
-if "results" not in st.session_state:
-    st.session_state.results = []
-if "cloudflare_block" not in st.session_state:
-    st.session_state.cloudflare_block = False
+# ─────────────────────────────────────────────────────────────────────────────
+for key, default in [("processed", False), ("results", []), ("cf_block", False)]:
+    if key not in st.session_state:
+        st.session_state[key] = default
 
-# ----------------------------------------------------------------------
-# FILE UPLOAD
-# ----------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 1 — Install Chrome (runs once, cached)
+# ─────────────────────────────────────────────────────────────────────────────
+with st.spinner("Checking Chrome installation …"):
+    ok, install_log = install_chrome_if_needed()
+
+if not ok:
+    st.error("Chrome could not be installed. See details below.")
+    for line in install_log:
+        st.write(line)
+    st.stop()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 2 — File upload & fetch
+# ─────────────────────────────────────────────────────────────────────────────
 uploaded_file = st.file_uploader("Upload Excel File", type=["xlsx"])
 
 if uploaded_file and not st.session_state.processed:
     df = pd.read_excel(uploaded_file)
 
     if "LG Number" not in df.columns:
-        st.error("The uploaded file must contain a column named 'LG Number'.")
+        st.error("Column 'LG Number' not found in the uploaded file.")
         st.stop()
 
-    st.write(df)
+    st.dataframe(df)
 
-    start_clicked = st.button("Start Fetching", type="primary")
+    if st.button("▶ Start Fetching", type="primary"):
 
-    if start_clicked:
         try:
             browser = get_browser()
-        except RuntimeError as e:
-            st.error(
-                "Chromium or chromedriver could not be found on this server. "
-                "This means 'packages.txt' either wasn't picked up or didn't "
-                "install correctly. In the Streamlit Cloud dashboard: open "
-                "your app's menu -> 'Reboot app'. If that doesn't help, open "
-                "'Manage app' -> check the build logs for an 'apt-get' error "
-                "during the packages.txt install step."
-            )
-            st.code(str(e))
-            st.stop()
-        except WebDriverException as e:
-            st.error(
-                "Chromium/chromedriver were found but the browser still failed "
-                "to start. This is usually a container resource issue "
-                "(out of memory) rather than a missing-package issue."
-            )
+        except (RuntimeError, WebDriverException) as e:
+            st.error("Browser failed to start.")
             st.exception(e)
             st.stop()
 
-        results = []
-        total_records = len(df)
-        progress_bar = st.progress(0)
-        status_box = st.empty()
-        cloudflare_notice = st.empty()
+        results        = []
+        total          = len(df)
+        progress_bar   = st.progress(0)
+        status_slot    = st.empty()
+        cf_slot        = st.empty()
 
-        for index, cert in enumerate(df["LG Number"]):
-            cert_original = str(cert).strip()
-            url = f"https://www.igi.org/verify-your-report/?r={cert_original}"
+        for idx, cert in enumerate(df["LG Number"]):
+            cert = str(cert).strip()
+            url  = f"https://www.igi.org/verify-your-report/?r={cert}"
 
             try:
                 browser.get(url)
-
-                # Give Cloudflare a brief moment, then check once rather
-                # than sleeping a fixed amount regardless of need.
-                time.sleep(1.5)
+                time.sleep(1.5)          # short fixed pause for CF check
 
                 if page_has_cloudflare(browser):
-                    # A real Cloudflare "verify you are human" challenge
-                    # cannot be solved by code on a headless cloud server
-                    # (no display, no human to click it). We stop the
-                    # batch here rather than spin forever, and surface a
-                    # clear message so you know a manual restart/check is
-                    # needed -- this matches the trade-off you confirmed
-                    # (stay cloud-hosted, accept occasional manual restarts).
-                    st.session_state.cloudflare_block = True
-                    cloudflare_notice.error(
-                        f"Cloudflare verification triggered at certificate "
-                        f"{cert_original} ({index + 1}/{total_records}). "
-                        "This can't be solved automatically on a headless cloud "
-                        "server. Please wait a few minutes and click 'Start "
-                        "Fetching' again -- already-fetched rows below are kept."
+                    st.session_state.cf_block = True
+                    cf_slot.error(
+                        f"⚠️ Cloudflare challenge triggered at {cert} "
+                        f"({idx+1}/{total}). Wait a few minutes then click "
+                        "'Start Fetching' again — rows already fetched are kept."
                     )
                     break
 
                 page_text = wait_for_report_data(browser, timeout=15)
-                parsed = parse_report(page_text)
+                parsed    = parse_report(page_text)
 
-                # One retry if everything came back empty (page was slow)
-                if not parsed["Shape"] and not parsed["Carat"] and not parsed["Color"]:
+                # one retry if everything empty
+                if not parsed["Shape"] and not parsed["Carat"]:
                     time.sleep(2)
                     page_text = browser.execute_script("return document.body.innerText;")
-                    parsed = parse_report(page_text)
+                    parsed    = parse_report(page_text)
 
-                results.append({"LG Number": cert_original, **parsed})
+                results.append({"LG Number": cert, **parsed})
 
             except Exception as e:
-                status_box.warning(f"Error on {cert_original}: {e}")
-                results.append(
-                    {
-                        "LG Number": cert_original,
-                        "Shape": "",
-                        "Carat": "",
-                        "Color": "",
-                        "Clarity": "",
-                        "Growth Type": "",
-                    }
-                )
+                status_slot.warning(f"Error on {cert}: {e}")
+                results.append({"LG Number": cert, "Shape": "", "Carat": "",
+                                 "Color": "", "Clarity": "", "Growth Type": ""})
 
-            progress_percent = (index + 1) / total_records
-            progress_bar.progress(
-                progress_percent,
-                text=f"{int(progress_percent * 100)}% completed | Processing: {cert_original}",
-            )
+            pct = (idx + 1) / total
+            progress_bar.progress(pct, text=f"{int(pct*100)}% | {cert}")
 
-        st.session_state.results = results
+        st.session_state.results   = results
         st.session_state.processed = True
         st.rerun()
 
-# ----------------------------------------------------------------------
-# OUTPUT
-# ----------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 3 — Output
+# ─────────────────────────────────────────────────────────────────────────────
 if st.session_state.processed and st.session_state.results:
-    output_df = pd.DataFrame(st.session_state.results)
+    out_df = pd.DataFrame(st.session_state.results)
+    st.subheader("✅ Final Output")
+    st.dataframe(out_df)
 
-    st.subheader("Final Output")
-    st.dataframe(output_df)
-
-    output_file = "/tmp/diamond_output.xlsx"
-    output_df.to_excel(output_file, index=False)
-
-    with open(output_file, "rb") as file:
+    out_path = "/tmp/diamond_output.xlsx"
+    out_df.to_excel(out_path, index=False)
+    with open(out_path, "rb") as f:
         st.download_button(
-            label="Download Excel",
-            data=file,
+            label="⬇️ Download Excel",
+            data=f,
             file_name="diamond_output.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-    if st.button("Process a new file"):
+    if st.button("🔄 Process a new file"):
         st.session_state.processed = False
-        st.session_state.results = []
-        st.session_state.cloudflare_block = False
+        st.session_state.results   = []
+        st.session_state.cf_block  = False
         st.rerun()
