@@ -24,78 +24,78 @@ st.caption(
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CHROME INSTALLER
-# Install Google Chrome + matching ChromeDriver at first run.
-# We do this in Python (not packages.txt) because Streamlit Cloud runs
-# Debian Bullseye, and the chromium apt package for that version depends
-# on libasound2t64 which conflicts with the pre-installed libasound2 —
-# causing the "held broken packages" error seen in the build logs.
-# Downloading Chrome directly from Google avoids that conflict entirely.
 # ─────────────────────────────────────────────────────────────────────────────
 
-CHROME_DEB_URL   = "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb"
 CHROME_BIN       = "/usr/bin/google-chrome-stable"
 CHROMEDRIVER_BIN = "/usr/local/bin/chromedriver"
+CHROME_DEB_URL   = "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb"
+
+
+def run(cmd, **kwargs):
+    """Run a shell command, return (returncode, stdout, stderr)."""
+    r = subprocess.run(cmd, capture_output=True, text=True, **kwargs)
+    return r.returncode, r.stdout.strip(), r.stderr.strip()
 
 
 @st.cache_resource(show_spinner=False)
-def install_chrome_if_needed():
-    """
-    Download and install Google Chrome + matching ChromeDriver once per
-    container lifetime.  st.cache_resource means this runs only on the
-    first call; subsequent reruns reuse the cached result.
-    """
-    log = []
+def install_chrome():
+    log   = []
+    ok    = True
 
-    # ── 1. Chrome ──────────────────────────────────────────────────────────
+    # ── 1. Chrome ─────────────────────────────────────────────────────────
     if os.path.isfile(CHROME_BIN):
         log.append("✅ Chrome already installed.")
     else:
-        log.append("⬇️  Downloading Google Chrome …")
-        r = subprocess.run(
-            ["wget", "-q", "-O", "/tmp/chrome.deb", CHROME_DEB_URL],
-            capture_output=True, text=True
-        )
-        if r.returncode != 0:
-            return False, log + [f"wget failed: {r.stderr}"]
+        log.append("⬇️ Downloading Google Chrome …")
+        rc, out, err = run(["wget", "-q", "-O", "/tmp/chrome.deb", CHROME_DEB_URL])
+        if rc != 0:
+            return False, log + [f"❌ wget failed (rc={rc}): {err}"]
 
-        log.append("📦 Installing Chrome …")
-        # apt-get -f install resolves any minor dependency gaps automatically
-        subprocess.run(
-            ["apt-get", "install", "-y", "/tmp/chrome.deb"],
-            capture_output=True, env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
-        )
-        subprocess.run(
+        log.append("📦 Installing Chrome (dpkg) …")
+        rc, out, err = run(["dpkg", "-i", "/tmp/chrome.deb"])
+        log.append(f"   dpkg rc={rc} | stdout: {out[:300]} | stderr: {err[:300]}")
+
+        # Fix any broken deps
+        log.append("🔧 Fixing dependencies …")
+        rc2, out2, err2 = run(
             ["apt-get", "install", "-f", "-y"],
-            capture_output=True, env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
+            env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
         )
+        log.append(f"   apt-get -f rc={rc2} | {err2[:300]}")
 
         if not os.path.isfile(CHROME_BIN):
-            return False, log + ["❌ Chrome binary not found after install."]
+            # Try alternate binary name
+            alt = shutil.which("google-chrome") or shutil.which("google-chrome-stable")
+            if alt:
+                log.append(f"ℹ️ Chrome found at alternate path: {alt}")
+                # patch the constant for this run
+                globals()["CHROME_BIN"] = alt
+            else:
+                # List what google-chrome dpkg actually installed
+                rc3, out3, _ = run(["dpkg", "-L", "google-chrome-stable"])
+                log.append(f"   dpkg -L output: {out3[:500]}")
+                return False, log + ["❌ Chrome binary not found after dpkg + apt-get -f."]
+
         log.append("✅ Chrome installed.")
 
-    # ── 2. ChromeDriver ────────────────────────────────────────────────────
+    # ── 2. ChromeDriver ───────────────────────────────────────────────────
     if os.path.isfile(CHROMEDRIVER_BIN):
         log.append("✅ ChromeDriver already installed.")
         return True, log
 
-    # Read the exact Chrome version to fetch a matching driver
-    ver_out = subprocess.run(
-        [CHROME_BIN, "--version", "--no-sandbox"],
-        capture_output=True, text=True
-    )
-    # e.g. "Google Chrome 125.0.6422.76 "
-    raw_ver = ver_out.stdout.strip().split()[-1]        # "125.0.6422.76"
-    major   = raw_ver.split(".")[0]                     # "125"
-    log.append(f"🔎 Chrome version: {raw_ver} (major={major})")
+    # Get Chrome version
+    rc, ver_out, _ = run([CHROME_BIN, "--version", "--no-sandbox"])
+    raw_ver = ver_out.strip().split()[-1]   # e.g. "125.0.6422.76"
+    major   = raw_ver.split(".")[0]
+    log.append(f"🔎 Chrome version: {raw_ver}  (major={major})")
 
-    # ChromeDriver for Chrome ≥ 115 lives at the CfT JSON endpoint
+    # Fetch matching ChromeDriver from Chrome for Testing JSON
     import urllib.request, json
     try:
-        cft_url  = f"https://googlechromelabs.github.io/chrome-for-testing/known-good-versions-with-downloads.json"
-        with urllib.request.urlopen(cft_url, timeout=15) as resp:
+        url = "https://googlechromelabs.github.io/chrome-for-testing/known-good-versions-with-downloads.json"
+        with urllib.request.urlopen(url, timeout=20) as resp:
             data = json.load(resp)
 
-        # Find latest version whose major matches Chrome's major
         driver_url = None
         for entry in reversed(data["versions"]):
             if entry["version"].startswith(major + "."):
@@ -107,30 +107,26 @@ def install_chrome_if_needed():
                 break
 
         if not driver_url:
-            return False, log + [f"❌ No ChromeDriver found for major version {major}."]
+            return False, log + [f"❌ No ChromeDriver found for Chrome {major}."]
 
     except Exception as e:
-        return False, log + [f"❌ CfT lookup failed: {e}"]
+        return False, log + [f"❌ Version lookup failed: {e}"]
 
-    log.append(f"⬇️  Downloading ChromeDriver from {driver_url} …")
-    r = subprocess.run(
-        ["wget", "-q", "-O", "/tmp/chromedriver.zip", driver_url],
-        capture_output=True, text=True
-    )
-    if r.returncode != 0:
-        return False, log + [f"❌ wget chromedriver failed: {r.stderr}"]
+    log.append(f"⬇️ Downloading ChromeDriver …")
+    rc, _, err = run(["wget", "-q", "-O", "/tmp/chromedriver.zip", driver_url])
+    if rc != 0:
+        return False, log + [f"❌ wget chromedriver failed: {err}"]
 
-    subprocess.run(["unzip", "-o", "/tmp/chromedriver.zip", "-d", "/tmp/"], capture_output=True)
+    run(["unzip", "-o", "/tmp/chromedriver.zip", "-d", "/tmp/"])
 
-    # The zip extracts to  /tmp/chromedriver-linux64/chromedriver
-    extracted = glob.glob("/tmp/chromedriver-linux64/chromedriver")
-    if not extracted:
-        extracted = glob.glob("/tmp/chromedriver*/chromedriver")
-    if not extracted:
-        return False, log + ["❌ Could not find extracted chromedriver binary."]
+    found = glob.glob("/tmp/chromedriver-linux64/chromedriver")
+    if not found:
+        found = glob.glob("/tmp/chromedriver*/chromedriver")
+    if not found:
+        return False, log + ["❌ Extracted chromedriver binary not found."]
 
-    subprocess.run(["cp", extracted[0], CHROMEDRIVER_BIN])
-    subprocess.run(["chmod", "+x", CHROMEDRIVER_BIN])
+    run(["cp", found[0], CHROMEDRIVER_BIN])
+    run(["chmod", "+x", CHROMEDRIVER_BIN])
 
     if not os.path.isfile(CHROMEDRIVER_BIN):
         return False, log + ["❌ ChromeDriver not found after install."]
@@ -155,7 +151,6 @@ def get_browser():
     options = webdriver.ChromeOptions()
     options.binary_location = CHROME_BIN
     options.page_load_strategy = "eager"
-
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
@@ -226,13 +221,13 @@ for key, default in [("processed", False), ("results", []), ("cf_block", False)]
         st.session_state[key] = default
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 1 — Install Chrome (runs once, cached)
+# STEP 1 — Install Chrome (runs once per container, cached)
 # ─────────────────────────────────────────────────────────────────────────────
 with st.spinner("Checking Chrome installation …"):
-    ok, install_log = install_chrome_if_needed()
+    ok, install_log = install_chrome()
 
 if not ok:
-    st.error("Chrome could not be installed. See details below.")
+    st.error("Chrome could not be installed. Diagnostic output:")
     for line in install_log:
         st.write(line)
     st.stop()
@@ -260,11 +255,11 @@ if uploaded_file and not st.session_state.processed:
             st.exception(e)
             st.stop()
 
-        results        = []
-        total          = len(df)
-        progress_bar   = st.progress(0)
-        status_slot    = st.empty()
-        cf_slot        = st.empty()
+        results      = []
+        total        = len(df)
+        progress_bar = st.progress(0)
+        status_slot  = st.empty()
+        cf_slot      = st.empty()
 
         for idx, cert in enumerate(df["LG Number"]):
             cert = str(cert).strip()
@@ -272,21 +267,19 @@ if uploaded_file and not st.session_state.processed:
 
             try:
                 browser.get(url)
-                time.sleep(1.5)          # short fixed pause for CF check
+                time.sleep(1.5)
 
                 if page_has_cloudflare(browser):
                     st.session_state.cf_block = True
                     cf_slot.error(
-                        f"⚠️ Cloudflare challenge triggered at {cert} "
-                        f"({idx+1}/{total}). Wait a few minutes then click "
-                        "'Start Fetching' again — rows already fetched are kept."
+                        f"⚠️ Cloudflare challenge at {cert} ({idx+1}/{total}). "
+                        "Wait a few minutes then click 'Start Fetching' again."
                     )
                     break
 
                 page_text = wait_for_report_data(browser, timeout=15)
                 parsed    = parse_report(page_text)
 
-                # one retry if everything empty
                 if not parsed["Shape"] and not parsed["Carat"]:
                     time.sleep(2)
                     page_text = browser.execute_script("return document.body.innerText;")
