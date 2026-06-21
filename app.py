@@ -16,44 +16,28 @@ st.caption(
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PLAYWRIGHT BROWSER INSTALL
-# playwright install downloads Chromium into ~/.cache/ms-playwright/
-# No root needed — it's a user-level install.
-# We cache this with st.cache_resource so it only runs once per container.
+# Runs once per container. Installs Chromium into ~/.cache/ms-playwright/
+# No root needed — user-level install.
+# packages.txt provides the system shared libraries Chromium needs
+# (libglib2.0-0, libnss3, etc.) — those ARE installed at build time by
+# Streamlit Cloud's apt step which runs as root before the app starts.
 # ─────────────────────────────────────────────────────────────────────────────
 
 @st.cache_resource(show_spinner=False)
 def ensure_playwright_browser():
-    """Install Playwright's Chromium browser if not already present."""
-    cache_dir = os.path.expanduser("~/.cache/ms-playwright")
-    if os.path.isdir(cache_dir) and any(
-        "chromium" in d for d in os.listdir(cache_dir)
-    ):
-        return True, "✅ Playwright Chromium already installed."
-
+    # Always re-run install to make sure browser binary + libs are in sync
     result = subprocess.run(
-        ["playwright", "install", "chromium", "--with-deps"],
+        ["playwright", "install", "chromium"],
         capture_output=True,
         text=True,
     )
     if result.returncode != 0:
-        # --with-deps may fail without root; try without it
-        result2 = subprocess.run(
-            ["playwright", "install", "chromium"],
-            capture_output=True,
-            text=True,
-        )
-        if result2.returncode != 0:
-            return False, (
-                f"Install failed.\n"
-                f"Attempt 1 stderr: {result.stderr[:500]}\n"
-                f"Attempt 2 stderr: {result2.stderr[:500]}"
-            )
-
-    return True, "✅ Playwright Chromium installed successfully."
+        return False, f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+    return True, "✅ Playwright Chromium ready."
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLOUDFLARE + SCRAPING HELPERS
+# SCRAPING HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 CLOUDFLARE_MARKERS = [
@@ -118,13 +102,13 @@ for key, default in [("processed", False), ("results", []), ("cf_block", False)]
         st.session_state[key] = default
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 1 — Ensure Playwright browser is installed
+# STEP 1 — Ensure browser is ready
 # ─────────────────────────────────────────────────────────────────────────────
-with st.spinner("Setting up browser (first run takes ~1 min) …"):
+with st.spinner("Setting up browser (first run ~60 sec) …"):
     pw_ok, pw_msg = ensure_playwright_browser()
 
 if not pw_ok:
-    st.error("Browser setup failed:")
+    st.error("Browser setup failed. Details:")
     st.code(pw_msg)
     st.stop()
 
@@ -137,15 +121,14 @@ if uploaded_file and not st.session_state.processed:
     df = pd.read_excel(uploaded_file)
 
     if "LG Number" not in df.columns:
-        st.error("Column 'LG Number' not found. Make sure the header is exactly 'LG Number'.")
+        st.error("Column 'LG Number' not found. Check the header name is exactly 'LG Number'.")
         st.stop()
 
     st.dataframe(df)
 
     if st.button("▶ Start Fetching", type="primary"):
 
-        # Import here so Playwright is definitely installed before import
-        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+        from playwright.sync_api import sync_playwright
 
         results      = []
         total        = len(df)
@@ -187,15 +170,13 @@ if uploaded_file and not st.session_state.processed:
                             cf_slot.error(
                                 f"⚠️ Cloudflare challenge at {cert} "
                                 f"({idx+1}/{total}). Wait a few minutes "
-                                "then click 'Start Fetching' again — "
-                                "rows already fetched are saved below."
+                                "then click 'Start Fetching' again."
                             )
                             break
 
                         page_text = wait_for_report(page, timeout=15000)
                         parsed    = parse_report(page_text)
 
-                        # one retry if fields came back empty
                         if not parsed["Shape"] and not parsed["Carat"]:
                             time.sleep(2)
                             page_text = page.inner_text("body")
